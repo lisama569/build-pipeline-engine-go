@@ -1,0 +1,31 @@
+{
+  "name": "repo-checks",
+  "tasks": [
+    {
+      "name": "vet",
+      "program": "go",
+      "args": ["vet", "./..."],
+      "inputs": ["go.mod"],
+      "cacheable": true,
+      "idempotent": true,
+      "timeout_ms": 60000
+    },
+    {
+      "name": "build",
+      "program": "go",
+      "args": ["build", "./..."],
+      "inputs": ["go.mod"],
+      "cacheable": true,
+      "idempotent": true,
+      "timeout_ms": 60000
+    },
+    {
+      "name": "test",
+      "program": "go",
+      "args": ["test", "./..."],
+      "deps": ["vet", "build"],
+      "idempotent": true,
+      "timeout_ms": 120000
+    }
+  ]
+}
