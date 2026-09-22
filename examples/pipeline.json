@@ -1,0 +1,26 @@
+{
+  "name": "self-check",
+  "tasks": [
+    {
+      "id": "build",
+      "command": ["go", "build", "./..."],
+      "cache_inputs": {"step": "build"},
+      "idempotent": true
+    },
+    {
+      "id": "vet",
+      "deps": ["build"],
+      "command": ["go", "vet", "./..."],
+      "cache_inputs": {"step": "vet"},
+      "idempotent": true
+    },
+    {
+      "id": "test",
+      "deps": ["build"],
+      "command": ["go", "test", "./..."],
+      "cache_inputs": {"step": "test"},
+      "idempotent": true,
+      "timeout": "5m"
+    }
+  ]
+}

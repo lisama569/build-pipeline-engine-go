@@ -1,0 +1,8 @@
+# local pipeline cache
+.pipeline-cache/
+# test/scratch artifacts
+*.bad
+/tmp/
+# go
+*.test
+*.out
