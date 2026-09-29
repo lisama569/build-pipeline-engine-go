@@ -107,6 +107,13 @@ type TaskResult struct {
 	EndedAt   time.Time
 	// Cached is true when the result was restored from cache.
 	Cached bool
+	// Reused is true when the verdict was carried over from a previous run's
+	// resume checkpoint (task body not executed this run).
+	Reused bool
+	// RerunReason is set when the task was executed in a resuming run although
+	// the previous run already knew it (e.g. "prev_failed", "input_changed");
+	// empty for first-ever runs and clean (non-resuming) runs.
+	RerunReason string
 }
 
 // QueuePolicy selects the queuing strategy when all worker slots are busy.
@@ -141,6 +148,24 @@ type Config struct {
 	// RetryBackoffBase / Cap bound exponential backoff between attempts.
 	RetryBackoffBase time.Duration
 	RetryBackoffCap  time.Duration
+
+	// RunBudget bounds the total wall-clock duration of one run. Once it has
+	// elapsed no new task is dispatched, running work is canceled and the run
+	// converges bounded by ShutdownGrace with a distinguishable stop reason
+	// (budget_exhausted). Zero means no run-level budget (task timeouts and the
+	// parent context still apply).
+	RunBudget time.Duration
+	// StateDir is where per-pipeline resume checkpoints and run-history
+	// records live. Empty disables both resume and history.
+	StateDir string
+	// Resume makes a run reuse the still-valid successful verdicts of the
+	// previous run stored in StateDir; failed/skipped/canceled, changed-input,
+	// new and dependency-restructured tasks are re-executed. A checkpoint is
+	// written whenever StateDir is set, so a later run can always resume.
+	Resume bool
+	// HistoryRuns retains at most that many recent run records per pipeline;
+	// zero disables history. Values above the engine hard cap are clamped.
+	HistoryRuns int
 }
 
 // DefaultConfig returns conservative local defaults.

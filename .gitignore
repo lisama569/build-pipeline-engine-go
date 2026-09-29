@@ -1,5 +1,7 @@
 # local pipeline cache
 .pipeline-cache/
+# local run state (resume checkpoints + run history)
+.pipeline-state/
 # test/scratch artifacts
 *.bad
 /tmp/

@@ -31,16 +31,41 @@ type TaskReport struct {
 	Status       pipeline.TaskStatus `json:"status"`
 	Attempts     int                 `json:"attempts"`
 	Cached       bool                `json:"cached"`
+	Reused       bool                `json:"reused"`
+	RerunReason  string              `json:"rerun_reason,omitempty"`
 	Reason       string              `json:"reason"`
 	Detail       string              `json:"detail"`
 	Order        int                 `json:"order"`
 	OutputDigest string              `json:"output_digest"`
 }
 
+// ResumeMeta summarizes the resume decision for a run (zero value when the
+// run did not resume).
+type ResumeMeta struct {
+	Resumed     bool     `json:"resumed"`
+	ParentRunID string   `json:"parent_run_id,omitempty"`
+	ReusedTasks []string `json:"reused_tasks,omitempty"`
+	ReusedCount int      `json:"reused_count"`
+	ReranCount  int      `json:"reran_count"`
+	CachedCount int      `json:"cached_count"`
+}
+
+// Meta carries run-level metadata beyond the raw task results.
+type Meta struct {
+	RunID      string
+	StopReason pipeline.StopReason
+	Resume     ResumeMeta
+	RunBudget  time.Duration
+}
+
 // Report is the stable, JSON-serializable conclusion of one pipeline run.
 type Report struct {
 	Pipeline       string            `json:"pipeline"`
+	RunID          string            `json:"run_id,omitempty"`
 	Status         string            `json:"status"`
+	StopReason     string            `json:"stop_reason"`
+	RunBudget      string            `json:"run_budget,omitempty"`
+	Resume         ResumeMeta        `json:"resume"`
 	Tasks          []TaskReport      `json:"tasks"`
 	Trace          []scheduler.Event `json:"trace"`
 	Conclusion     string            `json:"conclusion"`
@@ -58,8 +83,15 @@ var nonDeterministicSources = []string{
 }
 
 // Build assembles a report from task results and the schedule trace. The
-// dispatch order is derived from the trace's dispatch/cache events.
+// dispatch order is derived from the trace's dispatch/cache/resume events.
 func Build(name string, results map[string]pipeline.TaskResult, events []scheduler.Event) *Report {
+	return BuildWithMeta(name, results, events, Meta{})
+}
+
+// BuildWithMeta assembles a report with run-level metadata (run id, stop
+// reason, resume/budget summary).
+func BuildWithMeta(name string, results map[string]pipeline.TaskResult,
+	events []scheduler.Event, meta Meta) *Report {
 	ids := make([]string, 0, len(results))
 	for id := range results {
 		ids = append(ids, id)
@@ -77,6 +109,8 @@ func Build(name string, results map[string]pipeline.TaskResult, events []schedul
 			Status:       r.Status,
 			Attempts:     r.Attempts,
 			Cached:       r.Cached,
+			Reused:       r.Reused,
+			RerunReason:  r.RerunReason,
 			Reason:       r.Reason,
 			Detail:       r.Detail,
 			Order:        i,
@@ -93,16 +127,39 @@ func Build(name string, results map[string]pipeline.TaskResult, events []schedul
 			}
 		}
 	}
+	// Budget exhaustion is its own observable run status even when no task
+	// had time to become canceled at the moment status is derived.
+	if meta.StopReason == pipeline.StopBudgetExhausted {
+		status = string(pipeline.StopBudgetExhausted)
+	}
 
 	r := &Report{
 		Pipeline:       name,
+		RunID:          meta.RunID,
 		Status:         status,
+		StopReason:     string(stopReason(meta.StopReason)),
+		RunBudget:      budgetString(meta.RunBudget),
+		Resume:         meta.Resume,
 		Tasks:          tasks,
 		Trace:          append([]scheduler.Event(nil), events...),
 		NonDeterminism: append([]string(nil), nonDeterministicSources...),
 	}
 	r.Conclusion = r.hashConclusion()
 	return r
+}
+
+func stopReason(r pipeline.StopReason) pipeline.StopReason {
+	if r == "" {
+		return pipeline.StopCompleted
+	}
+	return r
+}
+
+func budgetString(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	return d.String()
 }
 
 // hashConclusion hashes only the deterministic fields, in a canonical
@@ -120,12 +177,12 @@ func (r *Report) hashConclusion() string {
 	for i, t := range r.Tasks {
 		// A cache hit and a fresh success are the SAME conclusion: both mean
 		// the task's observable output is present and correct. Normalize so
-		// a cold run and a warm run over identical inputs hash identically.
+		// cold, warm and resuming runs over identical inputs hash identically.
 		status := string(t.Status)
 		reason := t.Reason
-		if t.Status == pipeline.StatusCacheHit {
+		if t.Status == pipeline.StatusCacheHit || t.Reused {
 			status = string(pipeline.StatusSucceeded)
-			reason = "ok" // cache_hit and fresh success are equivalent
+			reason = "ok" // reused/cached verdicts and fresh success are equivalent
 		}
 		ct[i] = canonTask{
 			ID: t.ID, Status: status, Reason: reason,
@@ -158,15 +215,33 @@ func (r *Report) JSON() ([]byte, error) {
 func (r *Report) Text() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pipeline %q: %s\n", r.Pipeline, r.Status)
+	if r.RunID != "" {
+		fmt.Fprintf(&b, "run: %s\n", r.RunID)
+	}
+	fmt.Fprintf(&b, "stop_reason: %s\n", r.StopReason)
+	if r.RunBudget != "" {
+		fmt.Fprintf(&b, "run_budget: %s\n", r.RunBudget)
+	}
+	if r.Resume.Resumed {
+		fmt.Fprintf(&b, "resume: parent=%s reused=%d reran=%d cached=%d\n",
+			orDash(r.Resume.ParentRunID), r.Resume.ReusedCount,
+			r.Resume.ReranCount, r.Resume.CachedCount)
+	}
 	fmt.Fprintf(&b, "conclusion: %s\n", r.Conclusion)
 	fmt.Fprintln(&b, "tasks (scheduling order):")
 	for _, t := range r.Tasks {
-		flag := ""
+		flags := ""
 		if t.Cached {
-			flag = " cached"
+			flags += " cached"
 		}
-		fmt.Fprintf(&b, "  #%d %-20s %-10s attempts=%d%s reason=%s\n",
-			t.Order, t.ID, t.Status, t.Attempts, flag, reasonOrDash(t.Reason))
+		if t.Reused {
+			flags += " reused"
+		}
+		if t.RerunReason != "" {
+			flags += " rerun=" + t.RerunReason
+		}
+		fmt.Fprintf(&b, "  #%d %-20s %-16s attempts=%d%s reason=%s\n",
+			t.Order, t.ID, t.Status, t.Attempts, flags, reasonOrDash(t.Reason))
 	}
 	fmt.Fprintln(&b, "trace:")
 	for _, ev := range r.Trace {
@@ -184,6 +259,13 @@ func reasonOrDash(r string) string {
 		return "-"
 	}
 	return r
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 var _ = time.Now

@@ -28,6 +28,11 @@ const (
 	ErrCacheCorrupt ErrorCode = "cache_corrupt"
 	// ErrCachePolluted: cached result conflicts with observed inputs.
 	ErrCachePolluted ErrorCode = "cache_polluted"
+	// ErrRunBudget: the run-wide time budget was exhausted.
+	ErrRunBudget ErrorCode = "run_budget_exhausted"
+	// ErrStateCorrupt: a resume checkpoint or history record failed
+	// validation and was rejected (the run proceeds without that state).
+	ErrStateCorrupt ErrorCode = "state_corrupt"
 )
 
 // Error is a classified pipeline error with stable, distinguishable reason.

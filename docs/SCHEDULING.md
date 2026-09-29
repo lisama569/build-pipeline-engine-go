@@ -62,24 +62,38 @@ repeat runs schedule identically:
 - With `Config.FailFast`, the first non-success completion cancels the run
   context: no new tasks launch and running tasks receive cancellation.
 
-## 6. Cancellation & bounded convergence
+## 6. Cancellation, run budget & bounded convergence
 
-Cancellation sources: parent `ctx` cancel (SIGINT/SIGTERM in the CLI) or
-fail-fast. Mechanics:
+Stop sources (all produce a distinguishable `stop_reason` in the report):
 
-1. `runCtx` is canceled; every attempt derives from it together with the
-   task's own timeout.
+- parent `ctx` cancel (SIGINT/SIGTERM in the CLI) -> `canceled`;
+- fail-fast after the first non-success -> `fail_fast`;
+- the run-wide `Config.RunBudget` elapsing -> `budget_exhausted`;
+- natural graph conclusion (success or propagated failure) -> `completed`.
+
+Mechanics:
+
+1. `runCtx` is canceled on all three non-natural sources; every attempt
+   derives from it together with the task's own timeout.
 2. In-process `ExecFunc`s observe `ctx.Done()`; local commands run in their
    own **process group** (`setpgid`) and the group is `SIGKILL`ed, with a
    2s `WaitDelay`, so children cannot be orphaned.
 3. Once launching has stopped and the last in-flight task ends, every
-   unlaunched task is marked `canceled` immediately.
+   unlaunched task is marked `canceled` immediately. Manual cancel/fail-fast
+   use reason `task_canceled`; budget exhaustion uses the distinct
+   `run_budget_exhausted` (the run-level `status` is `budget_exhausted`).
 4. `Config.ShutdownGrace` (default 10s, hard-capped at 60s) is a defensive
    backstop for a task that ignores cancellation; after it the bookkeeping
-   converges regardless.
+   force-converges regardless, so Run always returns within budget + grace.
+
+A budget timeout is independent of a task's own `Timeout`: a task that
+exceeds its deadline is `timed_out` (never retried) and, when the run budget
+is still open, the run ends naturally as `failed` rather than
+`budget_exhausted`. See [RESUME_BUDGET_HISTORY.md](RESUME_BUDGET_HISTORY.md).
 
 There is no path that returns while a worker is still blocked or while cache
-state is half-written (cache writes are temp-file + fsync + rename).
+state is half-written (cache/checkpoint writes are temp-file + fsync +
+rename).
 
 ## 7. Cross-pipeline consistency
 

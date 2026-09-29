@@ -109,22 +109,31 @@ Cancellation during backoff sleep is likewise interruptible and classified as
 | `FailFast` / `-fail-fast` | cancel on first failure | false | — |
 | `RetryBackoffBase` / — | backoff base | 50ms | >= 0 |
 | `RetryBackoffCap` / — | backoff cap | 2s | >= base |
+| `RunBudget` / `-run-budget` | total run wall-clock budget | 0 (off) | <= 24h |
+| `StateDir` / `-state` | resume checkpoint + history root | `.pipeline-state` | `""` disables |
+| `Resume` / `-resume` | reuse valid prior verdicts | false | needs `StateDir` |
+| `HistoryRuns` / `-history` | retained run records per pipeline | 10 | 0 off, <= 50 |
 
 Invalid configuration returns `config_invalid` before any task runs;
-out-of-range numeric values are either rejected (negative/zero attempts) or
-clamped (parallelism, timeouts, grace).
+out-of-range numeric values are either rejected (negative/zero attempts,
+negative budget, resume without a state directory) or clamped (parallelism,
+timeouts, grace, run budget, history retention).
 
 ## Deterministic report
 
 `report.Report` JSON includes, per task: `id`, `status`, `attempts`,
-`cached`, `reason`, `detail`, `order`, `output_digest`, plus the full
-scheduling `trace` (ordered, numbered decisions) and `conclusion`.
+`cached`, `reused`, `rerun_reason`, `reason`, `detail`, `order`,
+`output_digest`, plus the full scheduling `trace` (ordered, numbered
+decisions), `run_id`, `stop_reason`, optional `run_budget`, the `resume`
+summary and `conclusion`.
 
 `conclusion` is a sha256 over a canonical JSON of only the observable
-outcome: per task it hashes id, normalized status (a `cache_hit` normalizes
-to `succeeded`), normalized reason (`cache_hit` -> `ok`) and the output
-digest. Attempt counts, dispatch order, timestamps and stdout/stderr are
-excluded. Every excluded, potentially varying source is enumerated in
-`non_determinism`. Therefore identical inputs produce identical
-`conclusion` values on repeat runs even across cold/warm caches, while the
-`trace` still explains exactly what happened on that particular run.
+outcome: per task it hashes id, normalized status (a `cache_hit` or a reused
+verdict normalizes to `succeeded`), normalized reason (`cache_hit`/reused ->
+`ok`) and the output digest. Attempt counts, dispatch order, timestamps and
+stdout/stderr are excluded. Every excluded, potentially varying source is
+enumerated in `non_determinism`. Therefore identical inputs produce identical
+`conclusion` values on repeat runs even across cold/warm/resumed runs, while
+the `trace` still explains exactly what happened on that particular run. The
+resume reuse rules and run-history comparison are documented in
+[RESUME_BUDGET_HISTORY.md](RESUME_BUDGET_HISTORY.md).
