@@ -81,6 +81,13 @@ fail-fast. Mechanics:
 There is no path that returns while a worker is still blocked or while cache
 state is half-written (cache writes are temp-file + fsync + rename).
 
+A **run-wide budget** (`Config.RunBudget`) is a third, distinct stop cause in
+addition to parent cancellation and fail-fast: when it is used up no new task
+is dispatched, in-flight tasks are canceled and converge within the same
+grace, and the run concludes as `budget_exhausted`. It is never reported as a
+manual cancel or a task timeout. See
+[RESUME_BUDGET_HISTORY.md](RESUME_BUDGET_HISTORY.md).
+
 ## 7. Cross-pipeline consistency
 
 The engine owns one shared `cache.Store` and one `cache.InFlight` deduper.

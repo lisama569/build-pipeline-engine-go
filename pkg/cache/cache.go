@@ -77,7 +77,11 @@ func Open(dir string) (*Store, error) {
 func (s *Store) Enabled() bool { return s != nil && s.dir != "" }
 
 // Key computes the deterministic cache key for fp.
-func (s *Store) Key(fp Fingerprint) string {
+func (s *Store) Key(fp Fingerprint) string { return KeyFor(fp) }
+
+// KeyFor computes the deterministic cache key for fp without needing an open
+// store (the key is a pure function of the fingerprint).
+func KeyFor(fp Fingerprint) string {
 	h := sha256.New()
 	write := func(prefix, val string) {
 		h.Write([]byte(prefix))

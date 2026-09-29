@@ -26,6 +26,10 @@ func main() {
 		grace       = flag.Duration("shutdown-grace", 10*time.Second, "cancel convergence bound")
 		policy      = flag.String("queue", "fifo", "ready queue policy: fifo|priority")
 		cacheDir    = flag.String("cache", ".pipeline-cache", "cache directory (empty disables)")
+		stateDir    = flag.String("state", ".pipeline-state", "resume state directory (empty disables resume)")
+		historyDir  = flag.String("history", ".pipeline-history", "run history directory (empty disables)")
+		historyN    = flag.Int("history-runs", 10, "retained run records per pipeline (1..100)")
+		runBudget   = flag.Duration("run-budget", 0, "total wall-clock budget for the run (0 = none), e.g. 10m")
 		failFast    = flag.Bool("fail-fast", false, "cancel remaining work on first failure")
 		jsonOut     = flag.Bool("json", false, "emit machine-readable JSON report")
 	)
@@ -48,6 +52,10 @@ func main() {
 		ShutdownGrace:      *grace,
 		QueuePolicy:        pipeline.QueuePolicy(*policy),
 		CacheDir:           *cacheDir,
+		StateDir:           *stateDir,
+		HistoryDir:         *historyDir,
+		HistoryRuns:        *historyN,
+		RunBudget:          *runBudget,
 		FailFast:           *failFast,
 		RetryBackoffBase:   50 * time.Millisecond,
 		RetryBackoffCap:    2 * time.Second,
@@ -71,7 +79,12 @@ func main() {
 	} else {
 		fmt.Print(rep.Text())
 	}
-	if rep.Status != "succeeded" {
+	switch rep.Status {
+	case "succeeded":
+		return
+	case "budget_exhausted":
+		os.Exit(3) // distinct from failure (1) and usage (2)
+	default:
 		os.Exit(1)
 	}
 }

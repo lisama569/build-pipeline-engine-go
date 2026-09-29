@@ -18,7 +18,8 @@ func isSuccessStatus(st pipeline.TaskStatus) bool {
 // terminal failure-ish statuses that force downstream tasks to be skipped.
 func isFailureStatus(st pipeline.TaskStatus) bool {
 	switch st {
-	case pipeline.StatusFailed, pipeline.StatusTimedOut, pipeline.StatusCanceled, pipeline.StatusSkipped:
+	case pipeline.StatusFailed, pipeline.StatusTimedOut, pipeline.StatusCanceled,
+		pipeline.StatusSkipped, pipeline.StatusBudgetExhausted:
 		return true
 	}
 	return false

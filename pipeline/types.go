@@ -29,6 +29,11 @@ const (
 	StatusTimedOut TaskStatus = "timed_out"
 	// StatusCacheHit means the task output was restored from the cache.
 	StatusCacheHit TaskStatus = "cache_hit"
+	// StatusBudgetExhausted means the run-wide time budget was used up before
+	// this task could complete (never launched, or canceled while running).
+	// It is distinct from a task's own timeout (StatusTimedOut) and from
+	// manual cancellation (StatusCanceled).
+	StatusBudgetExhausted TaskStatus = "budget_exhausted"
 )
 
 // CommandSpec describes a local build/verification command to execute.
@@ -103,10 +108,20 @@ type TaskResult struct {
 	Detail string
 	Output ExecOutput
 	// StartedAt/EndedAt are recorded but excluded from conclusion hashing.
-	StartedAt time.Time
-	EndedAt   time.Time
+	StartedAt time.Time `json:"started_at,omitempty"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
 	// Cached is true when the result was restored from cache.
-	Cached bool
+	Cached bool `json:"cached,omitempty"`
+	// Reused is true when the result was carried over from a previous run by
+	// resume (inputs unchanged) rather than executed this run. It is orthogonal
+	// to Cached: resume works even for tasks with caching disabled.
+	Reused bool
+	// ReuseInvalidation explains why a task was re-executed instead of reused;
+	// empty for executed-for-the-first-time or normally cached tasks.
+	ReuseInvalidation string
+	// BasisHash is the per-task input fingerprint for the run that produced
+	// this result; resume compares it with the current basis to decide reuse.
+	BasisHash string
 }
 
 // QueuePolicy selects the queuing strategy when all worker slots are busy.
@@ -141,6 +156,22 @@ type Config struct {
 	// RetryBackoffBase / Cap bound exponential backoff between attempts.
 	RetryBackoffBase time.Duration
 	RetryBackoffCap  time.Duration
+	// RunBudget bounds the wall-clock time of one whole run. Zero means no
+	// run-level budget. Once the budget is used up no new task is launched;
+	// in-flight tasks are canceled and converge bounded by ShutdownGrace, and
+	// the run still concludes with a distinct "run_budget_exhausted" reason.
+	// It is independent of (and reported separately from) per-task timeouts
+	// and manual cancellation.
+	RunBudget time.Duration
+	// StateDir is where the last-run snapshot for resume is persisted, one
+	// subdirectory per pipeline. Empty disables resume.
+	StateDir string
+	// HistoryDir is where recent run records are kept for comparison, one
+	// subdirectory per pipeline. Empty disables history.
+	HistoryDir string
+	// HistoryRuns bounds how many recent run records are retained per pipeline
+	// (0 defaults to 10; values above the hard cap are clamped).
+	HistoryRuns int
 }
 
 // DefaultConfig returns conservative local defaults.

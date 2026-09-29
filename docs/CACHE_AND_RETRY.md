@@ -49,6 +49,11 @@ Each entry on disk is an envelope:
 A cache hit never invokes the task body, so hits produce no side effects and
 do not re-run non-idempotent work.
 
+The cache is orthogonal to **resume**: a task with `DisableCache: true` is
+still carried over on resume from the last-run snapshot (which stores a
+per-task input basis, not a cache entry). See
+[RESUME_BUDGET_HISTORY.md](RESUME_BUDGET_HISTORY.md).
+
 ## Retry policy
 
 Bounded exponential backoff between attempts:

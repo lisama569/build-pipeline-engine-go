@@ -4,6 +4,9 @@ A local build pipeline **orchestration and execution engine** for Go. It parses
 a task dependency graph, runs tasks with bounded parallelism, propagates
 failures and cancellation, caches results with invalidation semantics, applies
 bounded retries/backoff, and emits deterministic, machine-readable reports.
+It can also **resume** from the last run (reusing only unchanged successful
+tasks), enforce a **run-wide time budget**, and retain a **bounded, comparable
+history** of recent runs.
 
 It is driven by the repository's own build/verification entry points
 (`go build`, `go vet`, `go test`) and needs **no network, credentials or paid
@@ -19,12 +22,16 @@ resources**.
 | `pkg/exec/` | One attempt: in-process func or local command (process-group kill) |
 | `pkg/retry/` | Bounded exponential backoff + error classification |
 | `pkg/scheduler/` | Bounded-parallel deterministic scheduling, failure/cancel propagation |
+| `pkg/state/` | Last-run snapshot for resume (per-task input basis + flock) |
+| `pkg/history/` | Bounded run records + reuse/status/added/removed diff |
+| `pkg/filelock/` | Cross-process `flock` serializing state/history read-modify-write |
 | `pkg/report/` | Structured deterministic report + stable conclusion hash |
 | `engine/` | Wiring, config validation/bounds, declarative spec loader |
 | `cmd/pipeline/` | CLI |
 
-See [`docs/SCHEDULING.md`](docs/SCHEDULING.md) and
-[`docs/CACHE_AND_RETRY.md`](docs/CACHE_AND_RETRY.md) for the full rules.
+See [`docs/SCHEDULING.md`](docs/SCHEDULING.md),
+[`docs/CACHE_AND_RETRY.md`](docs/CACHE_AND_RETRY.md) and
+[`docs/RESUME_BUDGET_HISTORY.md`](docs/RESUME_BUDGET_HISTORY.md) for the full rules.
 
 ## Quick start
 
@@ -37,6 +44,12 @@ go run ./cmd/pipeline -spec examples/pipeline.json -json
 
 # disable caching
 go run ./cmd/pipeline -spec examples/pipeline.json -cache ""
+
+# resume from the last run + retain 10 comparable records; a whole-run budget
+go run ./cmd/pipeline -spec examples/pipeline.json \
+  -state .pipeline-state -history .pipeline-history -history-runs 10
+go run ./cmd/pipeline -spec examples/pipeline.json \
+  -state .pipeline-state -history .pipeline-history -run-budget 10m
 ```
 
 A task exits non-zero on any non-success conclusion.
@@ -94,5 +107,21 @@ contacts an external service.
   non-idempotent task is `retry_unsafe` and is not resubmitted.
 - **Deterministic reports:** `conclusion` hashes only the observable output
   (status normalized so cache hit == fresh success, output digest). All
-  wall-clock/host-dependent values are listed explicitly in
-  `non_determinism` instead of being hidden in logs.
+  wall-clock/host-dependent values (including the unique run id) are listed
+  explicitly in `non_determinism` instead of being hidden in logs.
+- **Resume:** enabled by `-state`; reuses the previous run's successful tasks
+  whose per-task input basis (own fingerprint + dep id/basis/output-digest
+  chain) is unchanged, re-runs failed/skipped/new/changed subtrees, survives
+  graph add/remove/rename/edge edits without substituting old results, works
+  for cache-disabled tasks, and produces the **same conclusion as a clean
+  from-scratch run** with the same inputs.
+- **Run budget:** `-run-budget` stops new dispatches when the whole-run
+  wall-clock is used up, cancels in-flight tasks bounded by `ShutdownGrace`,
+  always concludes with the distinct `budget_exhausted` run/task status and
+  reason `run_budget_exhausted`, distinguishable from `timed_out` (the task's
+  own deadline) and `canceled` (manual interrupt/fail-fast). The CLI exits `3`.
+- **History:** `-history` keeps at most `-history-runs` (default 10, cap 100)
+  records per pipeline; the report `diff` shows reused / re-executed
+  (with reason: `new_task`/`previous_not_success`/`input_changed`) /
+  status-changed / added / removed. Concurrent same-pipeline runs are
+  flock-serialized so records never overwrite or interleave.

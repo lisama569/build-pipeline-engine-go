@@ -6,3 +6,6 @@
 # go
 *.test
 *.out
+# resume state and run history
+.pipeline-state/
+.pipeline-history/
