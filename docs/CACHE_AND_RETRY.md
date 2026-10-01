@@ -49,9 +49,12 @@ Each entry on disk is an envelope:
 A cache hit never invokes the task body, so hits produce no side effects and
 do not re-run non-idempotent work.
 
-The cache is orthogonal to **resume**: a task with `DisableCache: true` is
-still carried over on resume from the last-run snapshot (which stores a
-per-task input basis, not a cache entry). See
+The cache is orthogonal to **resume**, and `DisableCache` is honored by
+both: a cache-disabled task bypasses the content cache on every run AND is
+always re-executed on resume (its side effects must run every time). Its
+unchanged downstream tasks can still be carried over - the scheduler
+verifies the re-executed output digest against the resume plan before
+reusing them. See
 [RESUME_BUDGET_HISTORY.md](RESUME_BUDGET_HISTORY.md).
 
 ## Retry policy

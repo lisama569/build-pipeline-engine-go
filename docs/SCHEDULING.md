@@ -74,19 +74,31 @@ fail-fast. Mechanics:
    2s `WaitDelay`, so children cannot be orphaned.
 3. Once launching has stopped and the last in-flight task ends, every
    unlaunched task is marked `canceled` immediately.
-4. `Config.ShutdownGrace` (default 10s, hard-capped at 60s) is a defensive
-   backstop for a task that ignores cancellation; after it the bookkeeping
-   converges regardless.
+4. `Config.ShutdownGrace` (default 10s, hard-capped at 60s) bounds the drain
+   for a task that ignores cancellation. When it expires the run
+   **force-converges**: every still-unfinished task is finalized with the
+   stop cause (`canceled`, or `budget_exhausted` when the run budget caused
+   the stop) and the run returns its conclusion **without waiting for the
+   uncooperative worker**. A task body stuck in its own loop therefore can
+   never hang the run: the conclusion is always reached within
+   `budget/timeout + ShutdownGrace`. (The stuck goroutine itself may outlive
+   the return - a goroutine cannot be killed - but it is inert: all results
+   are written only by the scheduler loop, which has already finished.)
 
-There is no path that returns while a worker is still blocked or while cache
-state is half-written (cache writes are temp-file + fsync + rename).
+Already-concluded tasks (succeeded, failed, skipped) are never rewritten by
+the force-convergence; only tasks without a final conclusion receive the
+stop-cause status.
+
+There is no path that returns while cache state is half-written (cache
+writes are temp-file + fsync + rename).
 
 A **run-wide budget** (`Config.RunBudget`) is a third, distinct stop cause in
 addition to parent cancellation and fail-fast: when it is used up no new task
 is dispatched, in-flight tasks are canceled and converge within the same
-grace, and the run concludes as `budget_exhausted`. It is never reported as a
-manual cancel or a task timeout. See
-[RESUME_BUDGET_HISTORY.md](RESUME_BUDGET_HISTORY.md).
+grace, and the run concludes as `budget_exhausted` - bounded by
+`RunBudget + ShutdownGrace` even when a task body ignores cancellation (see
+point 4 above). It is never reported as a manual cancel or a task timeout.
+See [RESUME_BUDGET_HISTORY.md](RESUME_BUDGET_HISTORY.md).
 
 ## 7. Cross-pipeline consistency
 

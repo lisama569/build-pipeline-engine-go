@@ -15,7 +15,14 @@ import (
 //     that failed, timed out, was canceled or was skipped is retried),
 //  3. the current basis equals the stored basis, i.e. neither this task's
 //     fingerprint (id/command/env/declared inputs) nor any transitive
-//     dependency's id/basis/output changed (edge edits included).
+//     dependency's id/basis/output changed (edge edits included),
+//  4. the task does not disable caching: DisableCache tasks have side
+//     effects and must really run on every run, so resume always
+//     re-executes them (reason cache_disabled). Their dependents remain
+//     reuse candidates - the plan folds the stored digest in and the
+//     scheduler verifies the re-executed digest at runtime, so an
+//     unchanged downstream task is still carried over and the conclusion
+//     matches a clean full run.
 //
 // bases is task id -> current basis for already-planned (topo-prior) nodes;
 // it is updated as the walk proceeds.
@@ -38,12 +45,15 @@ func PlanResume(g *graph.Graph, snap *Snapshot, baseEnvHash string) (*Plan, map[
 				depOK = false
 				break
 			}
-			// The digest folded in is the previous stored digest when that
-			// dep is reused; if the dep re-executes, the chain changes and
-			// this node must rerun too.
+			// The digest folded in is the previous stored digest whenever the
+			// dep has a reusable (successful) snapshot - even when the dep
+			// itself will re-execute (e.g. DisableCache tasks must run every
+			// time). If the re-executed dep produces a different digest, the
+			// scheduler's runtime basis check catches it and this node
+			// re-executes too; if it matches, this node is safely reused.
 			depEntry := plan.Entries[dn.Task.ID]
 			digest := ""
-			if depEntry.Reuse && depEntry.Snapshot != nil {
+			if depEntry.Snapshot != nil && Reusable(depEntry.Snapshot.Result.Status) {
 				digest = depEntry.Snapshot.Result.Output.Digest
 			} else {
 				depOK = false
@@ -66,6 +76,14 @@ func PlanResume(g *graph.Graph, snap *Snapshot, baseEnvHash string) (*Plan, map[
 		case !Reusable(old.Result.Status):
 			entry.Reuse = false
 			entry.Reason = ReasonNeverSucceeded
+			entry.Snapshot = &old
+		case depOK && old.BasisHash == basis && t.DisableCache:
+			// Cache-disabled tasks have side effects and must really run on
+			// every run; resume never carries them over. Their stored digest
+			// still seeded downstream planning above, and the scheduler
+			// verifies the fresh digest before reusing any dependent.
+			entry.Reuse = false
+			entry.Reason = ReasonCacheDisabled
 			entry.Snapshot = &old
 		case depOK && old.BasisHash == basis:
 			entry.Reuse = true

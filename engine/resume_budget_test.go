@@ -186,9 +186,12 @@ func TestResume_FailedTaskRerunsNeighborsReused(t *testing.T) {
 	t.Log("failed/skipped tasks re-ran; neighbors reused; conclusion matches clean run")
 }
 
-// TestResume_WorksWhenCacheDisabledPerTask: a DisableCache task is still
-// carried over by resume state; resume does not force a whole-graph rerun.
-func TestResume_WorksWhenCacheDisabledPerTask(t *testing.T) {
+// TestResume_DisableCacheTaskReexecutes_OthersReused_ConclusionMatchesCleanRun:
+// a DisableCache task has side effects and must really run on every run, so
+// resume re-executes it even when its inputs are unchanged. Its unchanged
+// downstream (and unrelated) tasks are still carried over, and the resumed
+// conclusion is identical to a clean full run.
+func TestResume_DisableCacheTaskReexecutes_OthersReused_ConclusionMatchesCleanRun(t *testing.T) {
 	stateDir, histDir := t.TempDir(), t.TempDir()
 	eng, err := engine.NewEngine(stateCfg(stateDir, histDir, 2))
 	if err != nil {
@@ -196,45 +199,160 @@ func TestResume_WorksWhenCacheDisabledPerTask(t *testing.T) {
 	}
 	defer eng.Close()
 
-	var executions int32
+	var nocacheRuns, downstreamRuns, soloRuns int32
 	mk := func() *pipeline.Pipeline {
 		noCache := &pipeline.Task{
 			ID: "nocache", DisableCache: true,
-			Run: func(context.Context, pipeline.ExecInput) (pipeline.ExecOutput, error) {
-				atomic.AddInt32(&executions, 1)
-				return pipeline.ExecOutput{Digest: "nocache-out"}, nil
+			CacheKeyInputs: map[string]string{"v": "1"},
+			Run: func(_ context.Context, _ pipeline.ExecInput) (pipeline.ExecOutput, error) {
+				atomic.AddInt32(&nocacheRuns, 1)
+				return pipeline.ExecOutput{Digest: "nocache-out"}, nil // deterministic
 			},
 		}
-		cached := &pipeline.Task{
-			ID: "cached", Deps: []string{"nocache"},
-			Run: func(context.Context, pipeline.ExecInput) (pipeline.ExecOutput, error) {
-				atomic.AddInt32(&executions, 1)
-				return pipeline.ExecOutput{Digest: "cached-out"}, nil
+		downstream := &pipeline.Task{
+			ID: "downstream", Deps: []string{"nocache"},
+			CacheKeyInputs: map[string]string{"v": "1"},
+			Run: func(_ context.Context, in pipeline.ExecInput) (pipeline.ExecOutput, error) {
+				atomic.AddInt32(&downstreamRuns, 1)
+				return pipeline.ExecOutput{Digest: "downstream<-" + in.DepResults["nocache"].Output.Digest}, nil
 			},
 		}
-		return &pipeline.Pipeline{Name: "mixed", Tasks: []*pipeline.Task{noCache, cached}}
+		solo := &pipeline.Task{
+			ID: "solo", CacheKeyInputs: map[string]string{"v": "1"},
+			Run: func(context.Context, pipeline.ExecInput) (pipeline.ExecOutput, error) {
+				atomic.AddInt32(&soloRuns, 1)
+				return pipeline.ExecOutput{Digest: "solo-out"}, nil
+			},
+		}
+		return &pipeline.Pipeline{Name: "mixed", Tasks: []*pipeline.Task{noCache, downstream, solo}}
 	}
-	if _, err := eng.Run(context.Background(), mk()); err != nil {
+
+	first, err := eng.Run(context.Background(), mk())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := atomic.LoadInt32(&executions); got != 2 {
-		t.Fatalf("first run executes both, got %d", got)
+	if first.Status != "succeeded" {
+		t.Fatalf("first run status=%s", first.Status)
 	}
+	if got := atomic.LoadInt32(&nocacheRuns); got != 1 {
+		t.Fatalf("first run must execute nocache once, got %d", got)
+	}
+
 	second, err := eng.Run(context.Background(), mk())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := atomic.LoadInt32(&executions); got != 2 {
-		t.Fatalf("resume must not re-execute cache-disabled tasks, got %d", got)
+	// The cache-disabled task re-executed; everything unchanged did not.
+	if got := atomic.LoadInt32(&nocacheRuns); got != 2 {
+		t.Fatalf("DisableCache task must re-execute on resume, ran %d times", got)
+	}
+	if got := atomic.LoadInt32(&downstreamRuns); got != 1 {
+		t.Fatalf("unchanged downstream must be reused, ran %d times", got)
+	}
+	if got := atomic.LoadInt32(&soloRuns); got != 1 {
+		t.Fatalf("unrelated task must be reused, ran %d times", got)
+	}
+	byID := map[string]engineTaskReport{}
+	for _, tr := range second.Tasks {
+		byID[tr.ID] = engineTaskReport{reused: tr.Reused, invalidation: tr.ReuseInvalidation, status: string(tr.Status)}
+	}
+	if byID["nocache"].reused {
+		t.Fatal("DisableCache task must not be marked reused")
+	}
+	if byID["nocache"].invalidation != "cache_disabled" {
+		t.Fatalf("nocache invalidation=%q, want cache_disabled", byID["nocache"].invalidation)
+	}
+	if !byID["downstream"].reused || !byID["solo"].reused {
+		t.Fatalf("unchanged tasks must be reused: %+v", byID)
+	}
+
+	// The resumed conclusion equals a clean full run over the same graph.
+	refEng, err := engine.NewEngine(stateCfg("", "", 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer refEng.Close()
+	ref, err := refEng.Run(context.Background(), mk())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Conclusion != ref.Conclusion {
+		t.Fatalf("resume conclusion %s != clean run %s", second.Conclusion, ref.Conclusion)
+	}
+	t.Log("DisableCache task re-executed; unchanged tasks reused; conclusion matches clean run")
+}
+
+type engineTaskReport struct {
+	reused       bool
+	invalidation string
+	status       string
+}
+
+// TestResume_DisableCacheDigestChangeCascades: when a re-executed
+// DisableCache task produces a DIFFERENT digest than the snapshot, its
+// downstream can no longer be reused and re-executes as well - exactly what
+// a clean run would do.
+func TestResume_DisableCacheDigestChangeCascades(t *testing.T) {
+	stateDir, histDir := t.TempDir(), t.TempDir()
+	eng, err := engine.NewEngine(stateCfg(stateDir, histDir, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	var digestVersion int32 = 1
+	var downstreamRuns int32
+	mk := func() *pipeline.Pipeline {
+		noCache := &pipeline.Task{
+			ID: "nocache", DisableCache: true,
+			CacheKeyInputs: map[string]string{"v": "1"},
+			Run: func(_ context.Context, _ pipeline.ExecInput) (pipeline.ExecOutput, error) {
+				return pipeline.ExecOutput{Digest: fmt.Sprintf("side-effect-v%d", atomic.LoadInt32(&digestVersion))}, nil
+			},
+		}
+		downstream := &pipeline.Task{
+			ID: "downstream", Deps: []string{"nocache"},
+			CacheKeyInputs: map[string]string{"v": "1"},
+			Run: func(_ context.Context, in pipeline.ExecInput) (pipeline.ExecOutput, error) {
+				atomic.AddInt32(&downstreamRuns, 1)
+				return pipeline.ExecOutput{Digest: "downstream<-" + in.DepResults["nocache"].Output.Digest}, nil
+			},
+		}
+		return &pipeline.Pipeline{Name: "cascade", Tasks: []*pipeline.Task{noCache, downstream}}
+	}
+
+	if _, err := eng.Run(context.Background(), mk()); err != nil {
+		t.Fatal(err)
+	}
+	atomic.StoreInt32(&digestVersion, 2) // side effect now yields a new output
+	second, err := eng.Run(context.Background(), mk())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&downstreamRuns); got != 2 {
+		t.Fatalf("downstream must re-execute when the re-run dep digest changed, ran %d", got)
 	}
 	for _, tr := range second.Tasks {
-		if !tr.Reused {
-			t.Fatalf("task %s should be reused even with cache disabled", tr.ID)
-		}
-		if tr.Cached {
-			t.Fatalf("resume reuse is not a cache hit")
+		if tr.ID == "downstream" {
+			if tr.Reused {
+				t.Fatal("downstream of a changed DisableCache output must not be reused")
+			}
+			if tr.ReuseInvalidation != "input_changed" {
+				t.Fatalf("downstream invalidation=%q, want input_changed", tr.ReuseInvalidation)
+			}
 		}
 	}
+	// And the conclusion matches a clean run over the v2 side effect.
+	refEng, _ := engine.NewEngine(stateCfg("", "", 2))
+	defer refEng.Close()
+	ref, err := refEng.Run(context.Background(), mk())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Conclusion != ref.Conclusion {
+		t.Fatalf("cascaded resume conclusion %s != clean %s", second.Conclusion, ref.Conclusion)
+	}
+	t.Log("changed DisableCache output cascaded to downstream; conclusion matches clean run")
 }
 
 // TestResume_RepeatedSameInputs_StableConclusionAndNoExec: same inputs run
@@ -278,6 +396,89 @@ func TestResume_RepeatedSameInputs_StableConclusionAndNoExec(t *testing.T) {
 	if got := atomic.LoadInt32(&executions); got != 4 {
 		t.Fatalf("only first run should execute; got %d executions", got)
 	}
+}
+
+// TestRunBudget_UncooperativeTaskStillConcludesBounded: when the run budget
+// is used up and a task body IGNORES cancellation (stuck in its own loop),
+// the whole run must still conclude within a bounded time
+// (budget + shutdown grace) and report every unfinished task as
+// budget_exhausted - never as a task timeout or a manual cancel - while
+// already-succeeded tasks keep their conclusion untouched.
+func TestRunBudget_UncooperativeTaskStillConcludesBounded(t *testing.T) {
+	c := stateCfg("", "", 2)
+	c.RunBudget = 100 * time.Millisecond
+	c.ShutdownGrace = 200 * time.Millisecond
+	c.DefaultTaskTimeout = 30 * time.Second // per-task timeout far away
+	eng, err := engine.NewEngine(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) }) // let the stuck worker exit at test end
+
+	tasks := []*pipeline.Task{
+		{ID: "fast", Run: func(context.Context, pipeline.ExecInput) (pipeline.ExecOutput, error) {
+			return pipeline.ExecOutput{Digest: "fast-ok"}, nil
+		}},
+		{ID: "stubborn", Timeout: 30 * time.Second,
+			Run: func(ctx context.Context, _ pipeline.ExecInput) (pipeline.ExecOutput, error) {
+				<-release // deliberately ignores ctx cancellation entirely
+				return pipeline.ExecOutput{}, ctx.Err()
+			}},
+		{ID: "cooperative", Timeout: 30 * time.Second,
+			Run: func(ctx context.Context, _ pipeline.ExecInput) (pipeline.ExecOutput, error) {
+				<-ctx.Done()
+				return pipeline.ExecOutput{}, ctx.Err()
+			}},
+	}
+
+	type outcome struct {
+		status, reason string
+		tasks          map[string]string
+		reasons        map[string]string
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		r, err := eng.Run(context.Background(), &pipeline.Pipeline{Name: "budget-stuck", Tasks: tasks})
+		if err != nil {
+			done <- outcome{}
+			return
+		}
+		o := outcome{status: r.Status, reason: r.EndReason,
+			tasks: map[string]string{}, reasons: map[string]string{}}
+		for _, tr := range r.Tasks {
+			o.tasks[tr.ID] = string(tr.Status)
+			o.reasons[tr.ID] = tr.Reason
+		}
+		done <- o
+	}()
+
+	// The run must conclude bounded by budget+grace, far below any hang.
+	select {
+	case <-time.After(5 * time.Second):
+		t.Fatal("run with uncooperative task did not conclude within bounded time")
+	case o := <-done:
+		if o.status != "budget_exhausted" {
+			t.Fatalf("run status=%s, want budget_exhausted", o.status)
+		}
+		if o.reason != "run_budget_exhausted" {
+			t.Fatalf("end reason=%s, want run_budget_exhausted", o.reason)
+		}
+		if o.tasks["fast"] != "succeeded" {
+			t.Fatalf("already-succeeded task disturbed: %s", o.tasks["fast"])
+		}
+		for _, id := range []string{"stubborn", "cooperative"} {
+			if o.tasks[id] != "budget_exhausted" {
+				t.Fatalf("task %s status=%s, want budget_exhausted (not timeout/cancel)", id, o.tasks[id])
+			}
+			if o.reasons[id] != "run_budget_exhausted" {
+				t.Fatalf("task %s reason=%s, want run_budget_exhausted", id, o.reasons[id])
+			}
+		}
+	}
+	t.Log("budget exhausted with uncooperative task: run still concluded bounded, statuses distinct")
 }
 
 // TestRunBudget_ExhaustionConvergesAndDistinct: once the budget is used up no

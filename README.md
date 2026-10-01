@@ -112,16 +112,22 @@ contacts an external service.
 - **Resume:** enabled by `-state`; reuses the previous run's successful tasks
   whose per-task input basis (own fingerprint + dep id/basis/output-digest
   chain) is unchanged, re-runs failed/skipped/new/changed subtrees, survives
-  graph add/remove/rename/edge edits without substituting old results, works
-  for cache-disabled tasks, and produces the **same conclusion as a clean
-  from-scratch run** with the same inputs.
+  graph add/remove/rename/edge edits without substituting old results, and
+  produces the **same conclusion as a clean from-scratch run** with the same
+  inputs. `DisableCache` tasks are always re-executed on resume (their side
+  effects must run every time) without forcing unchanged downstream tasks to
+  re-run.
 - **Run budget:** `-run-budget` stops new dispatches when the whole-run
   wall-clock is used up, cancels in-flight tasks bounded by `ShutdownGrace`,
-  always concludes with the distinct `budget_exhausted` run/task status and
-  reason `run_budget_exhausted`, distinguishable from `timed_out` (the task's
-  own deadline) and `canceled` (manual interrupt/fail-fast). The CLI exits `3`.
+  and always concludes within `budget + ShutdownGrace` - even when a task
+  body ignores cancellation - with the distinct `budget_exhausted` run/task
+  status and reason `run_budget_exhausted`, distinguishable from `timed_out`
+  (the task's own deadline) and `canceled` (manual interrupt/fail-fast).
+  Already-concluded tasks are never rewritten by the finalization. The CLI
+  exits `3`.
 - **History:** `-history` keeps at most `-history-runs` (default 10, cap 100)
   records per pipeline; the report `diff` shows reused / re-executed
-  (with reason: `new_task`/`previous_not_success`/`input_changed`) /
-  status-changed / added / removed. Concurrent same-pipeline runs are
-  flock-serialized so records never overwrite or interleave.
+  (with reason: `new_task`/`previous_not_success`/`input_changed`/
+  `cache_disabled`) / status-changed / added / removed. Concurrent
+  same-pipeline runs are flock-serialized so records never overwrite or
+  interleave.

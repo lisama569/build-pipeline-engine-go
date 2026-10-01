@@ -1,8 +1,10 @@
 // Package state persists the last-run snapshot that powers "resume": a later
 // run carries over only successful tasks whose per-task input basis is
-// unchanged, and re-executes everything else. Resume therefore works even
-// when individual tasks have caching disabled, and a changed/renamed/removed
-// task can never be silently substituted with an old result.
+// unchanged, and re-executes everything else. Tasks with caching disabled
+// (DisableCache) are never carried over - their side effects must really run
+// every time - but their dependents stay reuse candidates, verified against
+// the re-executed digest at runtime. A changed/renamed/removed task can
+// never be silently substituted with an old result.
 //
 // Per-task input basis (computed in topological order):
 //
@@ -226,6 +228,12 @@ const (
 	// ReasonBasisChanged: this task's own fingerprint or an upstream input
 	// changed (input/command/env/dependency edit, or upstream output change).
 	ReasonBasisChanged = "input_changed"
+	// ReasonCacheDisabled: the task opts out of caching (DisableCache), so it
+	// has side effects that must really run on every run; resume never
+	// carries it over even when its inputs are unchanged. Downstream tasks
+	// are still reuse-candidates: the stored digest seeds their plan basis
+	// and the scheduler verifies the re-executed digest at runtime.
+	ReasonCacheDisabled = "cache_disabled"
 )
 
 // PlanEntry is the resume decision for one task.

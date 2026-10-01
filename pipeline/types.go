@@ -68,7 +68,10 @@ type Task struct {
 	// Idempotent declares whether re-execution after a failed attempt is safe.
 	// Non-idempotent tasks are executed at most once per run.
 	Idempotent bool
-	// DisableCache turns caching off for this task.
+	// DisableCache turns caching off for this task. Such tasks have side
+	// effects and must really run every time: the content cache is bypassed
+	// AND resume never carries their previous result over (dependents may
+	// still be reused when the fresh output digest matches).
 	DisableCache bool
 }
 
@@ -114,7 +117,8 @@ type TaskResult struct {
 	Cached bool `json:"cached,omitempty"`
 	// Reused is true when the result was carried over from a previous run by
 	// resume (inputs unchanged) rather than executed this run. It is orthogonal
-	// to Cached: resume works even for tasks with caching disabled.
+	// to Cached: resume reuses snapshot conclusions, not cache entries.
+	// (DisableCache tasks are never reused - they re-execute every run.)
 	Reused bool
 	// ReuseInvalidation explains why a task was re-executed instead of reused;
 	// empty for executed-for-the-first-time or normally cached tasks.
@@ -160,8 +164,11 @@ type Config struct {
 	// run-level budget. Once the budget is used up no new task is launched;
 	// in-flight tasks are canceled and converge bounded by ShutdownGrace, and
 	// the run still concludes with a distinct "run_budget_exhausted" reason.
-	// It is independent of (and reported separately from) per-task timeouts
-	// and manual cancellation.
+	// The conclusion is reached within RunBudget+ShutdownGrace even when a
+	// task body ignores cancellation: after the grace window every unfinished
+	// task is finalized as budget_exhausted and the run returns without
+	// waiting for uncooperative workers. It is independent of (and reported
+	// separately from) per-task timeouts and manual cancellation.
 	RunBudget time.Duration
 	// StateDir is where the last-run snapshot for resume is persisted, one
 	// subdirectory per pipeline. Empty disables resume.

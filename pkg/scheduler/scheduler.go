@@ -16,13 +16,20 @@
 //     Identical work across pipelines is executed once via the shared
 //     InFlight deduper, and all observers get the same conclusion.
 //   - Resume: a resume plan may mark tasks "reused" (previous success with an
-//     unchanged per-task input basis). Reused tasks are pre-concluded before
-//     the worker pool starts; they never execute, independently of whether
-//     the task has caching enabled.
+//     unchanged per-task input basis). Reuse is verified lazily, the moment a
+//     task becomes ready: the runtime basis (folding the ACTUAL digests of
+//     re-executed dependencies) must still equal the plan basis, otherwise
+//     the task really runs. Tasks with caching disabled are never reused -
+//     their side effects must run every time - but their dependents stay
+//     reuse candidates and are carried over when the fresh digest matches.
 //   - Run budget: Config.RunBudget, once used up, stops all new dispatches,
 //     cancels in-flight work (bounded convergence), and concludes the run
 //     with the distinguishable status budget_exhausted - never confused with
-//     a per-task timeout (timed_out) or a manual cancel (canceled).
+//     a per-task timeout (timed_out) or a manual cancel (canceled). The
+//     conclusion is bounded even when a task body ignores cancellation:
+//     after Config.ShutdownGrace the run force-converges, marks every
+//     unfinished task with the stop cause and returns without waiting for
+//     the uncooperative worker.
 package scheduler
 
 import (
@@ -56,6 +63,7 @@ const (
 	EvCancel          = "cancel"
 	EvTimeout         = "timeout"
 	EvReuse           = "reused"
+	EvReuseInvalidate = "reuse_invalidated"
 	EvBudgetExhausted = "budget_exhausted"
 )
 
@@ -192,32 +200,74 @@ func (s *Scheduler) Run(ctx context.Context) RunResult {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 
-	// 0) Resume: pre-conclude every task the plan marks reusable, in
-	// topological order. They never reach a worker, cost no attempt, and are
-	// indistinguishable (for conclusion purposes) from a fresh success.
+	var queued []*graph.Node
+	queuedSet := make(map[string]bool, len(s.g.Nodes()))
+	inflight := 0
+	finished := 0
+	total := len(s.g.Nodes())
+	launchStopped := false
+	cause := abortNone
 	reused := 0
-	if s.plan != nil {
-		for _, n := range s.g.Topo() {
-			e, ok := s.plan.Entries[n.Task.ID]
-			if !ok || !e.Reuse {
-				continue
-			}
-			r := e.Snapshot.Result
-			r.TaskID = n.Task.ID
-			r.Reused = true
-			r.ReuseInvalidation = ""
-			r.BasisHash = e.BasisHash
-			results[n.Task.ID] = r
-			s.record(n.Task.ID, r)
-			bases[n.Task.ID] = e.BasisHash
-			track.Mark(n.Task.ID, r.Status)
-			reused++
-			s.emit(n.Task.ID, EvReuse,
-				"carried over from previous run; basis=%s body not executed", e.BasisHash[:12])
+
+	// tryReuse concludes n from the resume snapshot when the plan marks it
+	// reusable AND its runtime basis still equals the plan basis. The runtime
+	// check is what makes DisableCache re-execution safe: the plan folds the
+	// dependency's STORED digest into downstream bases, so if the re-executed
+	// dependency produced a different digest, the dependent's basis no longer
+	// matches and it really runs (and its own dependents re-verify in turn).
+	tryReuse := func(n *graph.Node) bool {
+		if s.plan == nil {
+			return false
 		}
-		if reused > 0 {
-			s.emit("-", EvValidated, "resume: %d/%d tasks reused, %d to execute",
-				reused, len(s.g.Nodes()), len(s.g.Nodes())-reused)
+		e, ok := s.plan.Entries[n.Task.ID]
+		if !ok || !e.Reuse {
+			return false
+		}
+		if basis := s.computeBasis(n, results, bases); basis != e.BasisHash {
+			e.Reuse = false
+			e.Reason = state.ReasonBasisChanged
+			s.plan.Entries[n.Task.ID] = e
+			s.emit(n.Task.ID, EvReuseInvalidate,
+				"upstream output changed during re-execution; executing instead of reusing")
+			return false
+		}
+		r := e.Snapshot.Result
+		r.TaskID = n.Task.ID
+		r.Reused = true
+		r.ReuseInvalidation = ""
+		r.BasisHash = e.BasisHash
+		results[n.Task.ID] = r
+		s.record(n.Task.ID, r)
+		bases[n.Task.ID] = e.BasisHash
+		track.Mark(n.Task.ID, r.Status)
+		finished++
+		reused++
+		s.emit(n.Task.ID, EvReuse,
+			"carried over from previous run; basis=%s body not executed", e.BasisHash[:12])
+		return true
+	}
+
+	enqueueReady := func() {
+		// Reuse conclusions cascade: concluding one task may make its
+		// dependents ready-and-reusable within the same pass.
+		for {
+			progress := false
+			for _, n := range track.Ready(s.g) {
+				if queuedSet[n.Task.ID] {
+					continue
+				}
+				if tryReuse(n) {
+					progress = true
+					continue
+				}
+				queuedSet[n.Task.ID] = true
+				s.emit(n.Task.ID, EvReady, "all deps succeeded; eligible")
+				s.emit(n.Task.ID, EvQueue, "%s", queueReason(n, len(queued), s.cfg.QueuePolicy))
+				queued = append(queued, n)
+			}
+			if !progress {
+				break
+			}
 		}
 	}
 
@@ -238,25 +288,6 @@ func (s *Scheduler) Run(ctx context.Context) RunResult {
 		}()
 	}
 
-	var queued []*graph.Node
-	queuedSet := make(map[string]bool, len(s.g.Nodes()))
-	inflight := 0
-	finished := reused
-	total := len(s.g.Nodes())
-	launchStopped := reused == total
-	cause := abortNone
-
-	enqueueReady := func() {
-		for _, n := range track.Ready(s.g) {
-			if queuedSet[n.Task.ID] {
-				continue
-			}
-			queuedSet[n.Task.ID] = true
-			s.emit(n.Task.ID, EvReady, "all deps succeeded; eligible")
-			s.emit(n.Task.ID, EvQueue, "%s", queueReason(n, len(queued), s.cfg.QueuePolicy))
-			queued = append(queued, n)
-		}
-	}
 	enqueueReady()
 
 	var budgetCh <-chan time.Time
@@ -264,6 +295,49 @@ func (s *Scheduler) Run(ctx context.Context) RunResult {
 		budgetCh = time.After(s.cfg.RunBudget)
 	}
 	var graceCh <-chan time.Time
+	// runDoneCh is nil-ed out once the stop signal has been consumed so the
+	// loop never busy-spins on an already-closed channel while draining.
+	runDoneCh := runCtx.Done()
+
+	// handleCompletion folds one worker completion into the run state. It is
+	// used both by the main select and by the grace-expiry drain, so a task
+	// that finished exactly at the deadline keeps its real conclusion.
+	handleCompletion := func(c completion) {
+		inflight--
+		finished++
+		res := c.result
+
+		// Budget stopped the run while this task was in flight: an
+		// observed canceled/deadline end is attributed to the budget, so
+		// it is never misreported as a manual cancel or task timeout.
+		if cause == abortBudget &&
+			(res.Status == pipeline.StatusCanceled || res.Status == pipeline.StatusTimedOut) {
+			s.emit(c.node.Task.ID, EvBudgetExhausted,
+				"in flight when the run budget was used up; bounded by grace=%s", s.cfg.ShutdownGrace)
+			res.Status = pipeline.StatusBudgetExhausted
+			res.Reason = string(pipeline.ErrRunBudget)
+			res.Detail = "run budget exhausted while task was in flight"
+		}
+
+		bases[c.node.Task.ID] = s.computeBasis(c.node, results, bases)
+		res.BasisHash = bases[c.node.Task.ID]
+		if s.plan != nil {
+			if e, ok := s.plan.Entries[c.node.Task.ID]; ok && !e.Reuse {
+				res.ReuseInvalidation = e.Reason
+			}
+		}
+		results[c.node.Task.ID] = res
+		s.record(c.node.Task.ID, res)
+		track.Mark(c.node.Task.ID, res.Status)
+		if s.cfg.FailFast && !pipeline.IsSuccess(res.Status) {
+			launchStopped = true
+			cause = abortCanceled
+			s.setAbort(abortCanceled)
+			s.emit(c.node.Task.ID, EvCancel, "fail-fast: no new tasks; canceling running work")
+			cancelRun()
+		}
+		enqueueReady()
+	}
 
 	finalizeUnlaunched := func(detail string, st pipeline.TaskStatus, reason string) {
 		for _, n := range s.g.Nodes() {
@@ -289,24 +363,34 @@ func (s *Scheduler) Run(ctx context.Context) RunResult {
 	endReason := pipeline.EndReasonCompleted
 	for finished < total {
 		// Propagate failure: every transitively blocked node -> skipped.
-		for _, n := range track.BlockedByFailed(s.g) {
-			dep := track.FailedDep(n.Task.ID)
-			s.emit(n.Task.ID, EvSkip, "upstream failure: dependency %q non-success", dep)
-			res := pipeline.TaskResult{
-				TaskID:    n.Task.ID,
-				Status:    pipeline.StatusSkipped,
-				Reason:    "upstream:" + dep,
-				Detail:    "skipped because dependency " + dep + " did not succeed",
-				EndedAt:   time.Now(),
-				StartedAt: time.Now(),
+		// Marking one node can block its own dependents, so propagate to
+		// quiescence BEFORE waiting on the select: no channel event may ever
+		// arrive again, and a skipped-but-unmarked chain would otherwise
+		// deadlock the run.
+		for {
+			blocked := track.BlockedByFailed(s.g)
+			if len(blocked) == 0 {
+				break
 			}
-			bases[n.Task.ID] = s.computeBasis(n, results, bases)
-			res.BasisHash = bases[n.Task.ID]
-			results[n.Task.ID] = res
-			s.record(n.Task.ID, res)
-			track.Mark(n.Task.ID, pipeline.StatusSkipped)
-			delete(queuedSet, n.Task.ID)
-			finished++
+			for _, n := range blocked {
+				dep := track.FailedDep(n.Task.ID)
+				s.emit(n.Task.ID, EvSkip, "upstream failure: dependency %q non-success", dep)
+				res := pipeline.TaskResult{
+					TaskID:    n.Task.ID,
+					Status:    pipeline.StatusSkipped,
+					Reason:    "upstream:" + dep,
+					Detail:    "skipped because dependency " + dep + " did not succeed",
+					EndedAt:   time.Now(),
+					StartedAt: time.Now(),
+				}
+				bases[n.Task.ID] = s.computeBasis(n, results, bases)
+				res.BasisHash = bases[n.Task.ID]
+				results[n.Task.ID] = res
+				s.record(n.Task.ID, res)
+				track.Mark(n.Task.ID, pipeline.StatusSkipped)
+				delete(queuedSet, n.Task.ID)
+				finished++
+			}
 		}
 
 		// Stop signal has fully drained: conclude immediately.
@@ -348,40 +432,7 @@ func (s *Scheduler) Run(ctx context.Context) RunResult {
 			enqueueReady()
 
 		case c := <-done:
-			inflight--
-			finished++
-			res := c.result
-
-			// Budget stopped the run while this task was in flight: an
-			// observed canceled/deadline end is attributed to the budget, so
-			// it is never misreported as a manual cancel or task timeout.
-			if cause == abortBudget &&
-				(res.Status == pipeline.StatusCanceled || res.Status == pipeline.StatusTimedOut) {
-				s.emit(c.node.Task.ID, EvBudgetExhausted,
-					"in flight when the run budget was used up; bounded by grace=%s", s.cfg.ShutdownGrace)
-				res.Status = pipeline.StatusBudgetExhausted
-				res.Reason = string(pipeline.ErrRunBudget)
-				res.Detail = "run budget exhausted while task was in flight"
-			}
-
-			bases[c.node.Task.ID] = s.computeBasis(c.node, results, bases)
-			res.BasisHash = bases[c.node.Task.ID]
-			if s.plan != nil {
-				if e, ok := s.plan.Entries[c.node.Task.ID]; ok && !e.Reuse {
-					res.ReuseInvalidation = e.Reason
-				}
-			}
-			results[c.node.Task.ID] = res
-			s.record(c.node.Task.ID, res)
-			track.Mark(c.node.Task.ID, res.Status)
-			if s.cfg.FailFast && !pipeline.IsSuccess(res.Status) {
-				launchStopped = true
-				cause = abortCanceled
-				s.setAbort(abortCanceled)
-				s.emit(c.node.Task.ID, EvCancel, "fail-fast: no new tasks; canceling running work")
-				cancelRun()
-			}
-			enqueueReady()
+			handleCompletion(c)
 
 		case <-budgetCh:
 			launchStopped = true
@@ -391,24 +442,32 @@ func (s *Scheduler) Run(ctx context.Context) RunResult {
 			s.emit("-", EvBudgetExhausted,
 				"run budget %s used up; no new tasks; canceling in-flight work", s.cfg.RunBudget)
 			cancelRun()
-			if s.cfg.ShutdownGrace > 0 {
-				graceCh = time.After(s.cfg.ShutdownGrace)
-			}
+			graceCh = time.After(s.cfg.ShutdownGrace)
 
-		case <-runCtx.Done():
+		case <-runDoneCh:
+			runDoneCh = nil // consume once; never spin on a closed channel
 			if !launchStopped {
 				launchStopped = true
 				cause = abortCanceled
 				s.setAbort(abortCanceled)
 				endReason = pipeline.EndReasonCanceled
 				s.emit("-", EvCancel, "run context ended; drain bounded by grace=%s", s.cfg.ShutdownGrace)
-				if s.cfg.ShutdownGrace > 0 {
-					graceCh = time.After(s.cfg.ShutdownGrace)
-				}
+				graceCh = time.After(s.cfg.ShutdownGrace)
 			}
 
 		case <-graceCh:
 			s.emit("-", EvCancel, "shutdown grace exceeded; force-converging")
+			// Record completions that crossed with the grace deadline, so an
+			// already-finished task keeps its real conclusion.
+		drain:
+			for {
+				select {
+				case c := <-done:
+					handleCompletion(c)
+				default:
+					break drain
+				}
+			}
 			if cause == abortBudget {
 				finalizeUnlaunched("run budget exhausted; shutdown grace exceeded",
 					pipeline.StatusBudgetExhausted, string(pipeline.ErrRunBudget))
@@ -419,11 +478,20 @@ func (s *Scheduler) Run(ctx context.Context) RunResult {
 				endReason = pipeline.EndReasonCanceled
 			}
 			close(work)
-			wg.Wait()
+			// Deliberately no wg.Wait(): a task body that ignores
+			// cancellation would block the wait forever and the run would
+			// never conclude. Stuck workers cannot mutate results (results
+			// are only written by this goroutine); their late sends land in
+			// the buffered done channel and are discarded. The run's
+			// conclusion is final and bounded now.
 			return RunResult{Results: results, Bases: bases, EndReason: endReason}
 		}
 	}
 
+	if reused > 0 {
+		s.emit("-", EvValidated, "resume: %d/%d tasks reused, %d executed",
+			reused, total, total-reused)
+	}
 	close(work)
 	wg.Wait()
 	return RunResult{Results: results, Bases: bases, EndReason: endReason}
