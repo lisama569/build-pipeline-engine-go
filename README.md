@@ -78,10 +78,14 @@ gofmt -l .
 go vet ./...
 go test ./...            # unit + integration
 go test -race ./...      # concurrency checks
+
+# the two behaviors fixed most recently, specifically:
+go test ./engine/ -run 'TestRunBudget_UncooperativeTaskConcludesBounded' -count=5
+go test ./engine/ -run 'TestResume_CacheDisabled' -count=5
 ```
 
 All tests use in-process functions and POSIX shell commands only; nothing
-contacts an external service.
+contacts an external service, needs credentials or costs money.
 
 ## Guarantees at a glance
 
@@ -97,7 +101,9 @@ contacts an external service.
   are never reported as success.
 - **Cancellation:** propagates into per-attempt contexts and OS process
   groups; converges immediately once running work ends, with `ShutdownGrace`
-  as a hard backstop. No dangling processes or half-written cache entries.
+  as a hard backstop - a task that ignores cancellation is abandoned (its
+  late result discarded) so no run can hang indefinitely. No dangling
+  processes or half-written cache entries.
 - **Cache:** key covers task id, command, environment fingerprint and all
   declared inputs. Entries are checksummed and atomically written (temp +
   fsync + rename). Corruption -> `cache_corrupt`; digest mismatch ->
@@ -112,16 +118,22 @@ contacts an external service.
 - **Resume:** enabled by `-state`; reuses the previous run's successful tasks
   whose per-task input basis (own fingerprint + dep id/basis/output-digest
   chain) is unchanged, re-runs failed/skipped/new/changed subtrees, survives
-  graph add/remove/rename/edge edits without substituting old results, works
-  for cache-disabled tasks, and produces the **same conclusion as a clean
-  from-scratch run** with the same inputs.
+  graph add/remove/rename/edge edits without substituting old results, and
+  produces the **same conclusion as a clean from-scratch run** with the same
+  inputs. Cache-disabled tasks (`disable_cache`) always re-execute on resume
+  (their side effects must really run) without forcing a whole-graph rerun:
+  downstream tasks are still carried over once the fresh dependency output
+  reproduces the recorded basis.
 - **Run budget:** `-run-budget` stops new dispatches when the whole-run
   wall-clock is used up, cancels in-flight tasks bounded by `ShutdownGrace`,
-  always concludes with the distinct `budget_exhausted` run/task status and
+  and - even if a task never honors cancellation - always concludes within
+  `budget + grace` with the distinct `budget_exhausted` run/task status and
   reason `run_budget_exhausted`, distinguishable from `timed_out` (the task's
-  own deadline) and `canceled` (manual interrupt/fail-fast). The CLI exits `3`.
+  own deadline) and `canceled` (manual interrupt/fail-fast). Already
+  concluded tasks keep their results. The CLI exits `3`.
 - **History:** `-history` keeps at most `-history-runs` (default 10, cap 100)
   records per pipeline; the report `diff` shows reused / re-executed
-  (with reason: `new_task`/`previous_not_success`/`input_changed`) /
-  status-changed / added / removed. Concurrent same-pipeline runs are
-  flock-serialized so records never overwrite or interleave.
+  (with reason: `new_task`/`previous_not_success`/`input_changed`/
+  `cache_disabled`) / status-changed / added / removed. Concurrent
+  same-pipeline runs are flock-serialized so records never overwrite or
+  interleave.

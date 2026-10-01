@@ -1,8 +1,12 @@
 // Package state persists the last-run snapshot that powers "resume": a later
 // run carries over only successful tasks whose per-task input basis is
-// unchanged, and re-executes everything else. Resume therefore works even
-// when individual tasks have caching disabled, and a changed/renamed/removed
-// task can never be silently substituted with an old result.
+// unchanged, and re-executes everything else. A task with DisableCache set
+// is NEVER carried over - its side effects must really run on every run -
+// but that alone does not force a whole-graph rerun: downstream tasks are
+// still carried over when the re-executed task's fresh output reproduces
+// the recorded basis (verified by the scheduler at run time). A
+// changed/renamed/removed task can never be silently substituted with an
+// old result.
 //
 // Per-task input basis (computed in topological order):
 //
@@ -226,6 +230,9 @@ const (
 	// ReasonBasisChanged: this task's own fingerprint or an upstream input
 	// changed (input/command/env/dependency edit, or upstream output change).
 	ReasonBasisChanged = "input_changed"
+	// ReasonCacheDisabled: the task declares DisableCache, so its side
+	// effects must really run on every run; resume never carries it over.
+	ReasonCacheDisabled = "cache_disabled"
 )
 
 // PlanEntry is the resume decision for one task.
@@ -235,6 +242,12 @@ type PlanEntry struct {
 	Snapshot    *TaskSnapshot
 	BasisHash   string
 	Fingerprint string
+	// Conditional marks a tentative reuse: the task matched its recorded
+	// basis only by folding a dependency's PREVIOUS output digest, and that
+	// dependency re-executes this run (e.g. it has caching disabled). The
+	// scheduler must re-verify the basis against the dependency's fresh
+	// output before carrying the task over; on mismatch the task executes.
+	Conditional bool
 }
 
 // Plan is the resume decision for a whole graph: task id -> entry.

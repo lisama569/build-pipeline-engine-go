@@ -75,16 +75,20 @@ fail-fast. Mechanics:
 3. Once launching has stopped and the last in-flight task ends, every
    unlaunched task is marked `canceled` immediately.
 4. `Config.ShutdownGrace` (default 10s, hard-capped at 60s) is a defensive
-   backstop for a task that ignores cancellation; after it the bookkeeping
-   converges regardless.
+   backstop for a task that ignores cancellation: after it expires the run
+   concludes **without waiting** for the uncooperative worker, so no run
+   can hang indefinitely.
 
-There is no path that returns while a worker is still blocked or while cache
-state is half-written (cache writes are temp-file + fsync + rename).
+There is no path that returns while cache state is half-written (cache
+writes are temp-file + fsync + rename). A worker whose task never honors
+cancellation may be abandoned mid-execution when the grace expires; its
+late result is discarded and never rewrites a concluded task.
 
 A **run-wide budget** (`Config.RunBudget`) is a third, distinct stop cause in
 addition to parent cancellation and fail-fast: when it is used up no new task
 is dispatched, in-flight tasks are canceled and converge within the same
-grace, and the run concludes as `budget_exhausted`. It is never reported as a
+grace (again without waiting for uncooperative tasks past it), and the run
+concludes as `budget_exhausted`. It is never reported as a
 manual cancel or a task timeout. See
 [RESUME_BUDGET_HISTORY.md](RESUME_BUDGET_HISTORY.md).
 

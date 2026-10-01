@@ -14,18 +14,21 @@ A run starts from the last successful conclusion of the same pipeline and
 
 1. the task id existed in the previous graph;
 2. its previous result was a success (`succeeded` / `cache_hit`);
-3. its current **input basis** equals the recorded basis.
+3. the task does **not** declare `DisableCache` (see below);
+4. its current **input basis** equals the recorded basis.
 
 Everything else is executed:
 
 - a task that **failed, timed out, was canceled or was skipped** last time;
 - a task whose own inputs changed;
 - a **new** task or a **renamed** task (a rename is a new id);
-- any task downstream of such a change.
+- a task with **`DisableCache: true`** (invalidation code `cache_disabled`);
+- any task downstream of such a change whose recorded basis no longer
+  matches the fresh dependency outputs.
 
-Reused tasks are pre-concluded before the worker pool starts: their bodies
-never run, they make no attempts, and their downstream tasks unblock
-immediately.
+Unconditionally reused tasks are pre-concluded before the worker pool
+starts: their bodies never run, they make no attempts, and their downstream
+tasks unblock immediately.
 
 ### Input basis (why graph edits can never be faked)
 
@@ -55,13 +58,30 @@ The successful subset is always persisted, even when a run ends with a
 failure or an exhausted budget, so the next run reuses everything that did
 succeed and only re-executes the affected part.
 
-### Resume is independent of the per-task cache
+### Cache-disabled tasks always re-execute on resume
 
-`DisableCache: true` (or an empty `-cache`) only disables the
-content-addressed result cache. Resume snapshots are stored separately and
-record the per-task basis and conclusion, so a pipeline containing
-cache-disabled tasks is still resumable: one such task does **not** force a
-whole-graph rerun.
+`DisableCache: true` means the task has side effects and must really run on
+every run. Resume honors that: a cache-disabled task is **never carried
+over**, no matter how unchanged its inputs are; it re-executes with the
+invalidation code `cache_disabled` (an empty `-cache` only disables the
+content-addressed result cache, not resume).
+
+That does **not** force a whole-graph rerun. The re-executed task's previous
+success digest is still folded into downstream bases as a planning estimate,
+so a downstream task stays reusable - but only **conditionally**: once the
+cache-disabled dependency finishes, the scheduler recomputes the dependent's
+basis from the *fresh* output digest.
+
+- Output identical to the recorded one -> the dependent is carried over
+  (its body never runs), exactly as a clean run would conclude.
+- Output changed -> the dependent (and transitively its own dependents, by
+  the same rule) re-executes, again exactly as a clean run would.
+
+Independent and upstream tasks are unaffected either way. Because every
+reuse is verified against the outputs a fresh run would have produced, the
+final `conclusion` is identical to a clean from-scratch run in both cases
+(`TestResume_CacheDisabledTaskReexecutes_OthersReused`,
+`TestResume_CacheDisabledOutputChangeRerunsDownstream`).
 
 ### Same final conclusion as a clean run
 
@@ -89,12 +109,20 @@ serialize rather than overwrite each other.
 time of an entire run:
 
 1. when the budget is used up, **no new task is dispatched**;
-2. in-flight tasks have their contexts canceled and converge bounded by
-   `Config.ShutdownGrace` (hard-capped 60s);
-3. tasks that never launch, and in-flight tasks whose end was caused by the
-   budget, are marked `budget_exhausted` with reason `run_budget_exhausted`;
-4. the run **always returns a report** (it never hangs), with run status and
-   `end_reason` set to `budget_exhausted`.
+2. in-flight tasks have their contexts canceled and are given
+   `Config.ShutdownGrace` (hard-capped 60s, default 10s when unset) to
+   finish;
+3. **the run never hangs, even if a task ignores cancellation**: once the
+   grace expires the run force-concludes *without waiting* for the
+   uncooperative worker. The whole run is therefore bounded by
+   `RunBudget + ShutdownGrace` no matter how a task misbehaves;
+4. tasks that never launch, and in-flight tasks whose end was caused by the
+   budget (including ones still stuck when the grace expired), are marked
+   `budget_exhausted` with reason `run_budget_exhausted`;
+5. tasks that already succeeded (or otherwise concluded) keep their
+   recorded conclusion untouched - the wind-down never rewrites them;
+6. the run **always returns a report**, with run status and `end_reason`
+   set to `budget_exhausted`.
 
 The budget is distinct from the other stop causes:
 
@@ -110,7 +138,10 @@ timeout. The CLI exits with code `3` on budget exhaustion, distinct from
 failure (`1`) and usage errors (`2`).
 
 `TestRunBudget_ExhaustionConvergesAndDistinct` verifies convergence and the
-distinct status; `TestRunBudget_DistinctFromManualCancelAndTaskTimeout`
+distinct status; `TestRunBudget_UncooperativeTaskConcludesBounded` runs a
+task that never honors cancellation and asserts the run still concludes
+within a bounded time with the right distinctions (repeated, also under
+`-race`); `TestRunBudget_DistinctFromManualCancelAndTaskTimeout`
 locks in all three outcomes.
 
 ## 3. Run history
@@ -129,7 +160,8 @@ recent retained record:
 
 - `reused`: carried over from the previous run;
 - `re-executed`: with the reason `new_task`, `previous_not_success`,
-  `input_changed`, or `executed` (a normal fresh execution);
+  `input_changed`, `cache_disabled`, or `executed` (a normal fresh
+  execution);
 - `status_changed`: tasks whose status differs, as `id:from->to`;
 - `added` / `removed`: graph membership changes.
 

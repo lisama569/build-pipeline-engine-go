@@ -68,7 +68,11 @@ type Task struct {
 	// Idempotent declares whether re-execution after a failed attempt is safe.
 	// Non-idempotent tasks are executed at most once per run.
 	Idempotent bool
-	// DisableCache turns caching off for this task.
+	// DisableCache turns caching off for this task: it is never restored
+	// from the content cache, and resume never carries it over either - a
+	// cache-disabled task re-executes on every run because its side effects
+	// must really happen. Downstream tasks may still be reused when the
+	// fresh output reproduces their recorded input basis.
 	DisableCache bool
 }
 
@@ -158,10 +162,13 @@ type Config struct {
 	RetryBackoffCap  time.Duration
 	// RunBudget bounds the wall-clock time of one whole run. Zero means no
 	// run-level budget. Once the budget is used up no new task is launched;
-	// in-flight tasks are canceled and converge bounded by ShutdownGrace, and
-	// the run still concludes with a distinct "run_budget_exhausted" reason.
+	// in-flight tasks are canceled and given ShutdownGrace to finish, after
+	// which the run concludes WITHOUT waiting for tasks that ignore
+	// cancellation - the whole run is bounded by RunBudget+ShutdownGrace and
+	// always ends with the distinguishable "run_budget_exhausted" reason.
 	// It is independent of (and reported separately from) per-task timeouts
-	// and manual cancellation.
+	// and manual cancellation, and already-concluded tasks are never
+	// rewritten by the wind-down.
 	RunBudget time.Duration
 	// StateDir is where the last-run snapshot for resume is persisted, one
 	// subdirectory per pipeline. Empty disables resume.

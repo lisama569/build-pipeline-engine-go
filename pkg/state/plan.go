@@ -13,9 +13,17 @@ import (
 //  1. the task id existed in the snapshot (rename/add => recompute),
 //  2. the previous result was a success status (succeeded/cache_hit; a task
 //     that failed, timed out, was canceled or was skipped is retried),
-//  3. the current basis equals the stored basis, i.e. neither this task's
+//  3. the task does not disable caching (DisableCache tasks have side
+//     effects that must really run on every run),
+//  4. the current basis equals the stored basis, i.e. neither this task's
 //     fingerprint (id/command/env/declared inputs) nor any transitive
 //     dependency's id/basis/output changed (edge edits included).
+//
+// When a dependency re-executes solely because it disables caching, its
+// recorded success digest is still folded into downstream bases, so an
+// unaffected downstream task stays reusable - but only CONDITIONALLY: the
+// scheduler re-verifies the basis against the dependency's fresh output at
+// run time and re-executes the task if the output actually changed.
 //
 // bases is task id -> current basis for already-planned (topo-prior) nodes;
 // it is updated as the walk proceeds.
@@ -27,25 +35,36 @@ func PlanResume(g *graph.Graph, snap *Snapshot, baseEnvHash string) (*Plan, map[
 	// was not reused still contributes its CURRENT basis once recomputed in
 	// the actual run, but for planning purposes the basis is fully
 	// deterministic from graph + fingerprints + stored digests along reused
-	// chains. When a dep is not reusable, the child cannot match anyway.
+	// chains. When a dep has no reusable stored success, the child cannot
+	// match anyway.
 	for _, n := range g.Topo() {
 		t := n.Task
 		deps := make([]DepInput, 0, len(n.Deps))
 		depOK := true
+		depReexecutes := false
 		for _, dn := range n.Deps {
 			b, known := bases[dn.Task.ID]
 			if !known {
 				depOK = false
 				break
 			}
-			// The digest folded in is the previous stored digest when that
-			// dep is reused; if the dep re-executes, the chain changes and
-			// this node must rerun too.
+			// The digest folded in is the dep's previous stored digest. It is
+			// exact when the dep is unconditionally reused; for a dep that
+			// re-executes despite a reusable stored success (cache disabled)
+			// it is a planning estimate the scheduler re-verifies at run
+			// time, so the child becomes a conditional reuse.
 			depEntry := plan.Entries[dn.Task.ID]
 			digest := ""
-			if depEntry.Reuse && depEntry.Snapshot != nil {
+			switch {
+			case depEntry.Reuse && depEntry.Snapshot != nil:
 				digest = depEntry.Snapshot.Result.Output.Digest
-			} else {
+				if depEntry.Conditional {
+					depReexecutes = true
+				}
+			case depEntry.Snapshot != nil && Reusable(depEntry.Snapshot.Result.Status):
+				digest = depEntry.Snapshot.Result.Output.Digest
+				depReexecutes = true
+			default:
 				depOK = false
 			}
 			deps = append(deps, DepInput{
@@ -67,8 +86,16 @@ func PlanResume(g *graph.Graph, snap *Snapshot, baseEnvHash string) (*Plan, map[
 			entry.Reuse = false
 			entry.Reason = ReasonNeverSucceeded
 			entry.Snapshot = &old
+		case t.DisableCache:
+			// Side effects must really run on every run; never carried
+			// over. Its stored success digest still lets downstream tasks
+			// plan a conditional reuse.
+			entry.Reuse = false
+			entry.Reason = ReasonCacheDisabled
+			entry.Snapshot = &old
 		case depOK && old.BasisHash == basis:
 			entry.Reuse = true
+			entry.Conditional = depReexecutes
 			entry.Snapshot = &old
 		default:
 			entry.Reuse = false

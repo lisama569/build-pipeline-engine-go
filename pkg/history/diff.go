@@ -15,7 +15,8 @@ type Diff struct {
 
 // ReexecutedTask names a task that re-ran and why. The reason is the stable
 // invalidation code from pkg/state (new_task / previous_not_success /
-// input_changed); "executed" means the task simply ran (cold/no resume).
+// input_changed / cache_disabled); "executed" means the task simply ran
+// (cold/no resume).
 type ReexecutedTask struct {
 	ID     string `json:"id"`
 	Reason string `json:"reason"`
